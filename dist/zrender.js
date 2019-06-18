@@ -1574,21 +1574,138 @@ function on(eventful, event, query, handler, context, isOnce) {
 }
 
 /**
- * 事件辅助类
- * @module zrender/core/event
- * @author Kener (@Kener-林峰, kener.linfeng@gmail.com)
+ * The algoritm is learnt from
+ * https://franklinta.com/2014/09/08/computing-css-matrix3d-transforms/
+ * And we made some optimization for matrix inversion.
+ * Other similar approaches:
+ * "cv::getPerspectiveTransform", "Direct Linear Transformation".
+ */
+
+var LN2 = Math.log(2);
+
+function determinant(rows, rank, rowStart, rowMask, colMask, detCache) {
+    var cacheKey = rowMask + '-' + colMask;
+    var fullRank = rows.length;
+
+    if (detCache.hasOwnProperty(cacheKey)) {
+        return detCache[cacheKey];
+    }
+
+    if (rank === 1) {
+        // In this case the colMask must be like: `11101111`. We can find the place of `0`.
+        var colStart = Math.round(Math.log(((1 << fullRank) - 1) & ~colMask) / LN2);
+        return rows[rowStart][colStart];
+    }
+
+    var subRowMask = rowMask | (1 << rowStart);
+    var subRowStart = rowStart + 1;
+    while (rowMask & (1 << subRowStart)) {
+        subRowStart++;
+    }
+
+    var sum = 0;
+    for (var j = 0, colLocalIdx = 0; j < fullRank; j++) {
+        var colTag = 1 << j;
+        if (!(colTag & colMask)) {
+            sum += (colLocalIdx % 2 ? -1 : 1) * rows[rowStart][j]
+                // det(subMatrix(0, j))
+                * determinant(rows, rank - 1, subRowStart, subRowMask, colMask | colTag, detCache);
+            colLocalIdx++;
+        }
+    }
+
+    detCache[cacheKey] = sum;
+
+    return sum;
+}
+
+/**
+ * Usage:
+ * ```js
+ * var transformer = buildTransformer(
+ *     [10, 44, 100, 44, 100, 300, 10, 300],
+ *     [50, 54, 130, 14, 140, 330, 14, 220]
+ * );
+ * var out = [];
+ * transformer && transformer([11, 33], out);
+ * ```
+ *
+ * Notice: `buildTransformer` may take more than 10ms in some Android device.
+ *
+ * @param {Array.<number>} src source four points, [x0, y0, x1, y1, x2, y2, x3, y3]
+ * @param {Array.<number>} dest destination four points, [x0, y0, x1, y1, x2, y2, x3, y3]
+ * @return {Function} transformer If fail, return null/undefined.
+ */
+function buildTransformer(src, dest) {
+    var mA = [
+        [src[0], src[1], 1, 0, 0, 0, -dest[0] * src[0], -dest[0] * src[1]],
+        [0, 0, 0, src[0], src[1], 1, -dest[1] * src[0], -dest[1] * src[1]],
+        [src[2], src[3], 1, 0, 0, 0, -dest[2] * src[2], -dest[2] * src[3]],
+        [0, 0, 0, src[2], src[3], 1, -dest[3] * src[2], -dest[3] * src[3]],
+        [src[4], src[5], 1, 0, 0, 0, -dest[4] * src[4], -dest[4] * src[5]],
+        [0, 0, 0, src[4], src[5], 1, -dest[5] * src[4], -dest[5] * src[5]],
+        [src[6], src[7], 1, 0, 0, 0, -dest[6] * src[6], -dest[6] * src[7]],
+        [0, 0, 0, src[6], src[7], 1, -dest[7] * src[6], -dest[7] * src[7]]
+    ];
+
+    var detCache = {};
+    var det = determinant(mA, 8, 0, 0, 0, detCache);
+    if (det === 0) {
+        return;
+    }
+
+    // `invert(mA) * dest`, that is, `adj(mA) / det * dest`.
+    var vh = [];
+    for (var i = 0; i < 8; i++) {
+        for (var j = 0; j < 8; j++) {
+            vh[j] == null && (vh[j] = 0);
+            vh[j] += ((i + j) % 2 ? -1 : 1)
+                // det(subMatrix(i, j))
+                * determinant(mA, 7, i === 0 ? 1 : 0, 1 << i, 1 << j, detCache)
+                / det * dest[i];
+        }
+    }
+
+    return function (out, srcPointX, srcPointY) {
+        var pk = srcPointX * vh[6] + srcPointY * vh[7] + 1;
+        out[0] = (srcPointX * vh[0] + srcPointY * vh[1] + vh[2]) / pk;
+        out[1] = (srcPointX * vh[3] + srcPointY * vh[4] + vh[5]) / pk;
+    };
+}
+
+/**
+ * Utilities for mouse or touch events.
  */
 
 var isDomLevel2 = (typeof window !== 'undefined') && !!window.addEventListener;
 
 var MOUSE_EVENT_REG = /^(?:mouse|pointer|contextmenu|drag|drop)|click/;
+var EVENT_SAVED_PROP = '___zrEVENTSAVED';
+var _calcOut = [];
 
-function getBoundingClientRect(el) {
-    // BlackBerry 5, iOS 3 (original iPhone) don't have getBoundingRect
-    return el.getBoundingClientRect ? el.getBoundingClientRect() : {left: 0, top: 0};
-}
-
-// `calculate` is optional, default false
+/**
+ * Get the `zrX` and `zrY`, which are relative to the top-left of
+ * the input `el`.
+ * CSS transform (2D & 3D) is supported.
+ *
+ * The strategy to fetch the coords:
+ * + If `calculate` is not set as `true`, users of this method should
+ * ensure that `el` is the same or the same size & location as `e.target`.
+ * Otherwise the result coords are probably not expected. Because we
+ * firstly try to get coords from e.offsetX/e.offsetY.
+ * + If `calculate` is set as `true`, the input `el` can be any element
+ * and we force to calculate the coords based on `el`.
+ * + The input `el` should be positionable (not position:static).
+ *
+ * The force `calculate` can be used in case like:
+ * When mousemove event triggered on ec tooltip, `e.target` is not `el`(zr painter.dom).
+ *
+ * @param {HTMLElement} el DOM element.
+ * @param {Event} e Mouse event or touch event.
+ * @param {Object} out Get `out.zrX` and `out.zrY` as the result.
+ * @param {boolean} [calculate=false] Whether to force calculate
+ *        the coordinates but not use ones provided by browser.
+ */
 function clientToLocal(el, e, out, calculate) {
     out = out || {};
 
@@ -1599,12 +1716,8 @@ function clientToLocal(el, e, out, calculate) {
     // (see http://www.jacklmoore.com/notes/mouse-position/)
     // In zr painter.dom, padding edge equals to border edge.
 
-    // FIXME
-    // When mousemove event triggered on ec tooltip, target is not zr painter.dom, and
-    // offsetX/Y is relative to e.target, where the calculation of zrX/Y via offsetX/Y
-    // is too complex. So css-transfrom dont support in this case temporarily.
     if (calculate || !env$1.canvasSupported) {
-        defaultGetZrXY(el, e, out);
+        calculateZrXY(el, e, out);
     }
     // Caution: In FireFox, layerX/layerY Mouse position relative to the closest positioned
     // ancestor element, so we should make sure el is positioned (e.g., not position:static).
@@ -1624,22 +1737,125 @@ function clientToLocal(el, e, out, calculate) {
     }
     // For some other device, e.g., IOS safari.
     else {
-        defaultGetZrXY(el, e, out);
+        calculateZrXY(el, e, out);
     }
 
     return out;
 }
 
-function defaultGetZrXY(el, e, out) {
-    // This well-known method below does not support css transform.
-    var box = getBoundingClientRect(el);
-    out.zrX = e.clientX - box.left;
-    out.zrY = e.clientY - box.top;
+function calculateZrXY(el, e, out) {
+    // BlackBerry 5, iOS 3 (original iPhone) don't have getBoundingRect.
+    if (el.getBoundingClientRect && env$1.domSupported) {
+        var ex = e.clientX;
+        var ey = e.clientY;
+
+        if (el.nodeName.toUpperCase() === 'CANVAS') {
+            // Original approach, which do not support CSS transform.
+            // marker can not be locationed in a canvas container
+            // (getBoundingClientRect is always 0). We do not support
+            // that input a pre-created canvas to zr while using css
+            // transform in iOS.
+            var box = el.getBoundingClientRect();
+            out.zrX = ex - box.left;
+            out.zrY = ey - box.top;
+            return;
+        }
+        else {
+            var saved = el[EVENT_SAVED_PROP] || (el[EVENT_SAVED_PROP] = {});
+            var transformer = preparePointerTransformer(prepareCoordMarkers(el, saved), saved);
+            if (transformer) {
+                transformer(_calcOut, ex, ey);
+                out.zrX = _calcOut[0];
+                out.zrY = _calcOut[1];
+                return;
+            }
+        }
+    }
+    out.zrX = out.zrY = 0;
+}
+
+function prepareCoordMarkers(el, saved) {
+    var markers = saved.markers;
+    if (markers) {
+        return markers;
+    }
+
+    markers = saved.markers = [];
+    var propLR = ['left', 'right'];
+    var propTB = ['top', 'bottom'];
+
+    for (var i = 0; i < 4; i++) {
+        var marker = document.createElement('div');
+        var stl = marker.style;
+        var idxLR = i % 2;
+        var idxTB = (i >> 1) % 2;
+        stl.cssText = [
+            'position:absolute',
+            'visibility: hidden',
+            'padding: 0',
+            'margin: 0',
+            'border-width: 0',
+            'width:0',
+            'height:0',
+            // 'width: 5px',
+            // 'height: 5px',
+            propLR[idxLR] + ':0',
+            propTB[idxTB] + ':0',
+            propLR[1 - idxLR] + ':auto',
+            propTB[1 - idxTB] + ':auto',
+            ''
+        ].join('!important;');
+        el.appendChild(marker);
+        markers.push(marker);
+    }
+
+    return markers;
+}
+
+function preparePointerTransformer(markers, saved) {
+    var transformer = saved.transformer;
+    var oldSrcCoords = saved.srcCoords;
+    var useOld = true;
+    var srcCoords = [];
+    var destCoords = [];
+
+    for (var i = 0; i < 4; i++) {
+        var rect = markers[i].getBoundingClientRect();
+        var ii = 2 * i;
+        var x = rect.left;
+        var y = rect.top;
+        srcCoords.push(x, y);
+        useOld &= oldSrcCoords && x === oldSrcCoords[ii] && y === oldSrcCoords[ii + 1];
+        destCoords.push(markers[i].offsetLeft, markers[i].offsetTop);
+    }
+
+    // Cache to avoid time consuming of `buildTransformer`.
+    return useOld
+        ? transformer
+        : (
+            saved.srcCoords = srcCoords,
+            saved.transformer = buildTransformer(srcCoords, destCoords)
+        );
 }
 
 /**
- * 如果存在第三方嵌入的一些dom触发的事件，或touch事件，需要转换一下事件坐标.
- * `calculate` is optional, default false.
+ * Normalize the coordinates of the input event.
+ *
+ * Get the `e.zrX` and `e.zrY`, which are relative to the top-left of
+ * the input `el`.
+ * Get `e.zrDelta` if using mouse wheel.
+ * Get `e.which`, see the comment inside this function.
+ *
+ * Do not calculate repeatly if `zrX` and `zrY` already exist.
+ *
+ * Notice: see comments in `clientToLocal`. check the relationship
+ * between the result coords and the parameters `el` and `calculate`.
+ *
+ * @param {HTMLElement} el DOM element.
+ * @param {Event} [e] Mouse event or touch event. For lagency IE,
+ *        do not need to input it and `window.event` is used.
+ * @param {boolean} [calculate=false] Whether to force calculate
+ *        the coordinates but not use ones provided by browser.
  */
 function normalizeEvent(el, e, calculate) {
 
@@ -1665,7 +1881,7 @@ function normalizeEvent(el, e, calculate) {
 
     // Add which for click: 1 === left; 2 === middle; 3 === right; otherwise: 0;
     // See jQuery: https://github.com/jquery/jquery/blob/master/src/event.js
-    // If e.which has been defined, if may be readonly,
+    // If e.which has been defined, it may be readonly,
     // see: https://developer.mozilla.org/en-US/docs/Web/API/MouseEvent/which
     var button = e.button;
     if (e.which == null && button !== undefined && MOUSE_EVENT_REG.test(e.type)) {
@@ -1725,12 +1941,10 @@ function removeEventListener(el, name, handler) {
 
 /**
  * preventDefault and stopPropagation.
- * Notice: do not do that in zrender. Upper application
- * do that if necessary.
+ * Notice: do not use this method in zrender. It can only be
+ * used by upper applications if necessary.
  *
- * @memberOf module:zrender/core/event
- * @method
- * @param {Event} e : event对象
+ * @param {Event} e A mouse or touch event.
  */
 var stop = isDomLevel2
     ? function (e) {
@@ -6661,7 +6875,12 @@ Style.prototype = {
     strokeOpacity: null,
 
     /**
-     * @type {Array.<number>}
+     * `true` is not supported.
+     * `false`/`null`/`undefined` are the same.
+     * `false` is used to remove lineDash in some 
+     * case that `null`/`undefined` can not be set. 
+     * (e.g., emphasis.lineStyle in echarts)
+     * @type {Array.<number>|boolean}
      */
     lineDash: null,
 
@@ -8843,7 +9062,9 @@ function Displayable(opts) {
 
     this._rect = null;
     // Shapes for cascade clipping.
-    this.__clipPaths = [];
+    // Can only be `null`/`undefined` or an non-empty array, MUST NOT be an empty array.
+    // because it is easy to only using null to check whether clipPaths changed.
+    this.__clipPaths = null;
 
     // FIXME Stateful must be mixined after style is setted
     // Stateful.call(this, opts);
@@ -9223,10 +9444,10 @@ function isDisplayableCulled(el, width, height) {
 }
 
 function isClipPathChanged(clipPaths, prevClipPaths) {
-    if (clipPaths === prevClipPaths) { // Can both be null or undefined
+    // displayable.__clipPaths can only be `null`/`undefined` or an non-empty array.
+    if (clipPaths === prevClipPaths) { 
         return false;
     }
-
     if (!clipPaths || !prevClipPaths || (clipPaths.length !== prevClipPaths.length)) {
         return true;
     }
@@ -9235,6 +9456,7 @@ function isClipPathChanged(clipPaths, prevClipPaths) {
             return true;
         }
     }
+    return false;
 }
 
 function doClip(clipPaths, ctx) {
@@ -9680,16 +9902,14 @@ Painter.prototype = {
         ) {
 
             var clipPaths = el.__clipPaths;
+            var prevElClipPaths = scope.prevElClipPaths;
 
             // Optimize when clipping on group with several elements
-            if (!scope.prevElClipPaths
-                || isClipPathChanged(clipPaths, scope.prevElClipPaths)
-            ) {
+            if (!prevElClipPaths || isClipPathChanged(clipPaths, prevElClipPaths)) {
                 // If has previous clipping state, restore from it
-                if (scope.prevElClipPaths) {
-                    currentLayer.ctx.restore();
+                if (prevElClipPaths) {
+                    ctx.restore();
                     scope.prevElClipPaths = null;
-
                     // Reset prevEl since context has been restored
                     scope.prevEl = null;
                 }
@@ -10582,7 +10802,7 @@ var domHandlers = {
 
         this._lastTouchMoment = new Date();
 
-        this.handler.processGesture(this, event, 'start');
+        this.handler.processGesture(event, 'start');
 
         // In touch device, trigger `mousemove`(`mouseover`) should
         // be triggered, and must before `mousedown` triggered.
@@ -10606,7 +10826,7 @@ var domHandlers = {
         // mouse event in upper applicatoin.
         event.zrByTouch = true;
 
-        this.handler.processGesture(this, event, 'change');
+        this.handler.processGesture(event, 'change');
 
         // Mouse move should always be triggered no matter whether
         // there is gestrue event, because mouse move and pinch may
@@ -10629,7 +10849,7 @@ var domHandlers = {
         // mouse event in upper applicatoin.
         event.zrByTouch = true;
 
-        this.handler.processGesture(this, event, 'end');
+        this.handler.processGesture(event, 'end');
 
         domHandlers.mouseup.call(this, event);
 
@@ -11035,14 +11255,14 @@ ZRender.prototype = {
      */
     refreshImmediately: function () {
         // var start = new Date();
+
         // Clear needsRefresh ahead to avoid something wrong happens in refresh
         // Or it will cause zrender refreshes again and again.
-        this._needsRefresh = false;
+        this._needsRefresh = this._needsRefreshHover = false;
         this.painter.refresh();
-        /**
-         * Avoid trigger zr.refresh in Element#beforeUpdate hook
-         */
-        this._needsRefresh = false;
+        // Avoid trigger zr.refresh in Element#beforeUpdate hook
+        this._needsRefresh = this._needsRefreshHover = false;
+        
         // var end = new Date();
         // var log = document.getElementById('log');
         // if (log) {
@@ -12060,9 +12280,11 @@ PathProxy.prototype = {
     /**
      * @readOnly
      */
-    setScale: function (sx, sy) {
-        this._ux = mathAbs(1 / devicePixelRatio / sx) || 0;
-        this._uy = mathAbs(1 / devicePixelRatio / sy) || 0;
+    setScale: function (sx, sy, segmentIgnoreThreshold) {
+        // Compat. Previously there is no segmentIgnoreThreshold.
+        segmentIgnoreThreshold = segmentIgnoreThreshold || 0;
+        this._ux = mathAbs(segmentIgnoreThreshold / devicePixelRatio / sx) || 0;
+        this._uy = mathAbs(segmentIgnoreThreshold / devicePixelRatio / sy) || 0;
     },
 
     getContext: function () {
@@ -13363,6 +13585,11 @@ Path.prototype = {
 
     strokeContainThreshold: 5,
 
+    // This item default to be false. But in map series in echarts,
+    // in order to improve performance, it should be set to true,
+    // so the shorty segment won't draw.
+    segmentIgnoreThreshold: 0,
+
     /**
      * See `module:zrender/src/graphic/helper/subPixelOptimize`.
      * @type {boolean}
@@ -13418,7 +13645,7 @@ Path.prototype = {
 
         // Update path sx, sy
         var scale = this.getGlobalScale();
-        path.setScale(scale[0], scale[1]);
+        path.setScale(scale[0], scale[1], this.segmentIgnoreThreshold);
 
         // Proxy context
         // Rebuild path in following 2 cases
@@ -15652,7 +15879,7 @@ var CompoundPath = Path.extend({
             if (!paths[i].path) {
                 paths[i].createPathProxy();
             }
-            paths[i].path.setScale(scale[0], scale[1]);
+            paths[i].path.setScale(scale[0], scale[1], paths[i].segmentIgnoreThreshold);
         }
     },
 
@@ -16548,26 +16775,6 @@ function bindStyle(svgEl, style, isText, el) {
     if (pathHasFill(style, isText)) {
         var fill = isText ? style.textFill : style.fill;
         fill = fill === 'transparent' ? NONE : fill;
-
-        /**
-         * FIXME:
-         * This is a temporary fix for Chrome's clipping bug
-         * that happens when a clip-path is referring another one.
-         * This fix should be used before Chrome's bug is fixed.
-         * For an element that has clip-path, and fill is none,
-         * set it to be "rgba(0, 0, 0, 0.002)" will hide the element.
-         * Otherwise, it will show black fill color.
-         * 0.002 is used because this won't work for alpha values smaller
-         * than 0.002.
-         *
-         * See
-         * https://bugs.chromium.org/p/chromium/issues/detail?id=659790
-         * for more information.
-         */
-        if (svgEl.getAttribute('clip-path') !== 'none' && fill === NONE) {
-            fill = 'rgba(0, 0, 0, 0.002)';
-        }
-
         attr(svgEl, 'fill', fill);
         attr(svgEl, 'fill-opacity', style.fillOpacity != null ? style.fillOpacity * style.opacity : style.opacity);
     }
@@ -16850,7 +17057,7 @@ var svgTextDrawRectText = function (el, rect, textRect) {
         ].join(' ')
         || DEFAULT_FONT$1;
 
-    var verticalAlign = getVerticalAlignForSvg(style.textVerticalAlign);
+    var verticalAlign = style.textVerticalAlign;
 
     textRect = getBoundingRect(
         text, font, align,
@@ -16869,11 +17076,11 @@ var svgTextDrawRectText = function (el, rect, textRect) {
         );
         x = newPos.x;
         y = newPos.y;
-        verticalAlign = getVerticalAlignForSvg(newPos.textVerticalAlign);
+        verticalAlign = newPos.textVerticalAlign;
         align = newPos.textAlign;
     }
 
-    attr(textSvgEl, 'alignment-baseline', verticalAlign);
+    setVerticalAlign(textSvgEl, verticalAlign);
 
     if (font) {
         textSvgEl.style.font = font;
@@ -16941,7 +17148,7 @@ var svgTextDrawRectText = function (el, rect, textRect) {
     }
 
     var dy = 0;
-    if (verticalAlign === 'after-edge') {
+    if (verticalAlign === 'bottom') {
         dy = -textRect.height + lineHeight;
         textPadding && (dy -= textPadding[2]);
     }
@@ -16963,7 +17170,7 @@ var svgTextDrawRectText = function (el, rect, textRect) {
             if (!tspan) {
                 tspan = tspanList[i] = createElement('tspan');
                 textSvgEl.appendChild(tspan);
-                attr(tspan, 'alignment-baseline', verticalAlign);
+                setVerticalAlign(tspan, verticalAlign);
                 attr(tspan, 'text-anchor', textAnchor);
             }
             else {
@@ -16995,15 +17202,21 @@ var svgTextDrawRectText = function (el, rect, textRect) {
     }
 };
 
-function getVerticalAlignForSvg(verticalAlign) {
-    if (verticalAlign === 'middle') {
-        return 'middle';
-    }
-    else if (verticalAlign === 'bottom') {
-        return 'after-edge';
-    }
-    else {
-        return 'hanging';
+function setVerticalAlign(textSvgEl, verticalAlign) {
+    switch (verticalAlign) {
+        case 'middle':
+            attr(textSvgEl, 'dominant-baseline', 'middle');
+            attr(textSvgEl, 'alignment-baseline', 'middle');
+            break;
+
+        case 'bottom':
+            attr(textSvgEl, 'dominant-baseline', 'ideographic');
+            attr(textSvgEl, 'alignment-baseline', 'ideographic');
+            break;
+
+        default:
+            attr(textSvgEl, 'dominant-baseline', 'hanging');
+            attr(textSvgEl, 'alignment-baseline', 'hanging');
     }
 }
 
@@ -17824,7 +18037,8 @@ ClippathManager.prototype.updateDom = function (
  */
 ClippathManager.prototype.markUsed = function (displayable) {
     var that = this;
-    if (displayable.__clipPaths && displayable.__clipPaths.length > 0) {
+    // displayable.__clipPaths can only be `null`/`undefined` or an non-empty array.
+    if (displayable.__clipPaths) {
         each(displayable.__clipPaths, function (clipPath) {
             if (clipPath._dom) {
                 Definable.prototype.markUsed.call(that, clipPath._dom);
@@ -18687,7 +18901,7 @@ if (!env$1.canvasSupported) {
         // if (style.lineCap != null) {
         //     el.endcap = style.lineCap;
         // }
-        if (style.lineDash != null) {
+        if (style.lineDash) {
             el.dashstyle = style.lineDash.join(' ');
         }
         if (style.stroke != null && !(style.stroke instanceof Gradient)) {
@@ -19485,7 +19699,7 @@ if (!env$1.canvasSupported) {
         updateFillAndStroke(textVmlEl, 'stroke', {
             stroke: style.textStroke,
             opacity: style.opacity,
-            lineDash: style.lineDash
+            lineDash: style.lineDash || null // style.lineDash can be `false`.
         }, this);
 
         textVmlEl.style.zIndex = getZIndex(this.zlevel, this.z, this.z2);
